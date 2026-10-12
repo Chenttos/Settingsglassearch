@@ -27,6 +27,8 @@ static const void *kSGSCoordinatorKey = &kSGSCoordinatorKey;
 @property (nonatomic, strong) UISearchController *searchController;   // the stock one, kept alive here
 @property (nonatomic, strong) SGSSearchBarView *bar;
 @property (nonatomic, assign) BOOL searchActive;
+@property (nonatomic, assign) BOOL stripping;
+@property (nonatomic, assign) BOOL insetsApplied;
 - (instancetype)initWithController:(UIViewController *)controller;
 - (void)controllerWillAppear;
 - (void)controllerWillDisappear;
@@ -61,13 +63,19 @@ static const void *kSGSCoordinatorKey = &kSGSCoordinatorKey;
 
 /// Take the stock search bar out of the nav bar, but keep the controller.
 - (void)stripStockSearchBar {
-    if (self.searchActive) return;
+    if (self.searchActive || self.stripping) return;
     UIViewController *vc = self.controller;
     if (!vc) return;
 
-    UISearchController *sc = [self findStockSearchController];
-    if (sc) self.searchController = sc;
-    if (vc.navigationItem.searchController) vc.navigationItem.searchController = nil;
+    self.stripping = YES;                    // setting the item re-lays-out the nav bar; never recurse
+    @try {
+        UISearchController *sc = [self findStockSearchController];
+        if (sc) self.searchController = sc;
+        if (vc.navigationItem.searchController) vc.navigationItem.searchController = nil;
+    } @catch (NSException *e) {
+        SGSLog(@"strip failed: %@", e);
+    }
+    self.stripping = NO;
 }
 
 #pragma mark install into the nav controller
@@ -84,9 +92,10 @@ static const void *kSGSCoordinatorKey = &kSGSCoordinatorKey;
     [host bringSubviewToFront:self.bar];
 
     // keep the last rows of the list reachable above the pill
-    UIEdgeInsets extra = vc.additionalSafeAreaInsets;
-    if (extra.bottom < 70.0) {
-        extra.bottom = 70.0;
+    if (!self.insetsApplied) {
+        self.insetsApplied = YES;
+        UIEdgeInsets extra = vc.additionalSafeAreaInsets;
+        extra.bottom += 70.0;
         vc.additionalSafeAreaInsets = extra;
     }
 }
@@ -208,34 +217,77 @@ static SGSCoordinator *SGSCoordinatorFor(UIViewController *vc) {
 
 %hook PSUIPrefsListController
 
-- (void)viewDidLoad {
-    %orig;
-    [SGSCoordinatorFor(self) stripStockSearchBar];
-}
-
+// Everything is deferred one runloop turn and wrapped, so a surprise in Settings' own
+// setup code can never take the app down with us.
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
-    [SGSCoordinatorFor(self) controllerWillAppear];
+    __weak UIViewController *weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *vc = weakSelf;
+        if (!vc.isViewLoaded || !vc.view.window) return;
+        @try {
+            SGSCoordinator *c = SGSCoordinatorFor(vc);
+            [c controllerWillAppear];
+            // Settings sometimes attaches its search bar a moment later; one retry, no loops.
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ [c stripStockSearchBar]; });
+        } @catch (NSException *e) {
+            SGSLog(@"viewWillAppear failed: %@", e);
+        }
+    });
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
     %orig;
-    [SGSCoordinatorFor(self) controllerWillDisappear];
-}
-
-- (void)viewDidLayoutSubviews {
-    %orig;
-    // Settings may re-attach its search bar during layout; keep it off while idle.
     SGSCoordinator *c = objc_getAssociatedObject(self, kSGSCoordinatorKey);
-    if (c && !c.searchActive) [c stripStockSearchBar];
+    @try { [c controllerWillDisappear]; } @catch (__unused NSException *e) {}
 }
 
 %end
 
 %end
+
+#pragma mark - crash guard
+
+// If Settings dies while this build is starting up, the next launch comes up with the tweak
+// switched off (and stays off until a new build number), so a bug here can't lock you out.
+static NSString *const kSGSBuild        = @"0.1.1";
+static NSString *const kSGSInFlightKey  = @"SGSLaunchInFlight";
+static NSString *const kSGSDisabledKey  = @"SGSDisabledBuild";
+
+static void SGSClearInFlight(void) {
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    [d removeObjectForKey:kSGSInFlightKey];
+    [d synchronize];
+}
 
 %ctor {
     // iOS 26 already ships this exact search bar - nothing to do there.
     if ([NSProcessInfo.processInfo isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){26, 0, 0}]) return;
+
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    if ([[d stringForKey:kSGSDisabledKey] isEqualToString:kSGSBuild]) {
+        SGSLog(@"disabled: Settings crashed during a previous launch with build %@", kSGSBuild);
+        return;
+    }
+    if ([d stringForKey:kSGSInFlightKey]) {
+        [d setObject:kSGSBuild forKey:kSGSDisabledKey];
+        [d removeObjectForKey:kSGSInFlightKey];
+        [d synchronize];
+        SGSLog(@"previous launch never finished - switching tweak off");
+        return;
+    }
+
+    [d setObject:kSGSBuild forKey:kSGSInFlightKey];
+    [d synchronize];
+    // "survived startup" = still alive after 8s, or the app was backgrounded normally
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ SGSClearInFlight(); });
+    for (NSNotificationName name in @[UIApplicationWillResignActiveNotification,
+                                      UIApplicationDidEnterBackgroundNotification]) {
+        [NSNotificationCenter.defaultCenter addObserverForName:name object:nil queue:nil
+                                                    usingBlock:^(NSNotification *n) { SGSClearInFlight(); }];
+    }
+
     %init(SettingsRoot);
 }

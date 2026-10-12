@@ -60,3 +60,9 @@ lines starting with `[SettingsGlassSearch]`. Likely spots to tweak:
 
 The glass code is derived from LiquidAss (CC BY-NC 4.0), so this tweak is **non-commercial**.
 See `NOTICE.md`.
+
+## Safe mode
+
+If Settings crashes while the tweak is starting, the next launch comes up with the tweak switched
+off (`SGSDisabledBuild` in Settings' defaults) and stays off until a new build number, so a bug
+here can't lock you out of Settings. Crash logs: `/var/mobile/Library/Logs/CrashReporter/Settings-*.ips`.

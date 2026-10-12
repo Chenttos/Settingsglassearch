@@ -1,6 +1,6 @@
 Package: com.dylv.settingsglasssearch
 Name: SettingsGlassSearch
-Version: 0.1.0
+Version: 0.1.1
 Architecture: iphoneos-arm
 Description: iOS 26 style floating Liquid Glass search bar for the Settings app (iOS 15-18)
 Maintainer: you
